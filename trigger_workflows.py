@@ -22,7 +22,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 
-def trigger_workflow_run(api_host: str, token: str, config: dict, package_id: str) -> dict:
+def trigger_workflow_run(api_host: str, token: str, refresh_token: str, config: dict, package_id: str) -> dict:
     """Trigger a single workflow run for one package."""
     payload = {
         "workflowInstanceConfiguration": {
@@ -61,16 +61,20 @@ def trigger_workflow_run(api_host: str, token: str, config: dict, package_id: st
         },
     }
     headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+    if refresh_token:
+        headers["x-refresh-token"] = refresh_token
     resp = requests.post(f"{api_host}/compute/workflows/runs", headers=headers, json=payload)
     resp.raise_for_status()
     return resp.json()
 
 
-def fetch_mri_packages(api_host: str, token: str, dataset_id: str) -> list[str]:
+def fetch_mri_packages(api_host: str, token: str, refresh_token: str, dataset_id: str) -> list[str]:
     """Fetch all non-deleted MRI packages from a dataset via the Pennsieve API."""
     # The packages endpoint is on the v1 API (api.pennsieve.io), not api2
     packages_host = api_host.replace("api2.", "api.")
     headers = {"Authorization": f"Bearer {token}"}
+    if refresh_token:
+        headers["x-refresh-token"] = refresh_token
     package_ids = []
     cursor = None
 
@@ -129,6 +133,8 @@ def main():
     parser.add_argument("--api-host", default=os.environ.get("PENNSIEVE_API_HOST", "https://api2.pennsieve.io"))
     parser.add_argument("--session-token", default=os.environ.get("PENNSIEVE_SESSION_TOKEN"),
                         help="Session token from the browser")
+    parser.add_argument("--refresh-token", default=os.environ.get("PENNSIEVE_REFRESH_TOKEN"),
+                        help="Refresh token from the browser (sent as x-refresh-token header)")
     parser.add_argument("--workflow-id", default=os.environ.get("WORKFLOW_ID"))
     parser.add_argument("--dataset-id", default=os.environ.get("DATASET_ID"))
     parser.add_argument("--compute-node-id", default=os.environ.get("COMPUTE_NODE_ID", "599f80a6-ab76-495b-85d9-f363825a2413"))
@@ -164,7 +170,7 @@ def main():
     package_ids = []
     if args.discover:
         print(f"Discovering MRI packages from dataset {args.dataset_id}...")
-        package_ids = fetch_mri_packages(args.api_host, args.session_token, args.dataset_id)
+        package_ids = fetch_mri_packages(args.api_host, args.session_token, args.refresh_token, args.dataset_id)
         print(f"Found {len(package_ids)} MRI packages.\n")
     else:
         if args.package_file:
@@ -208,7 +214,7 @@ def main():
     for i, pkg_id in enumerate(package_ids, 1):
         try:
             print(f"[{i}/{len(package_ids)}] Triggering for package: {pkg_id}...", end=" ")
-            result = trigger_workflow_run(args.api_host, token, workflow_config, pkg_id)
+            result = trigger_workflow_run(args.api_host, token, args.refresh_token, workflow_config, pkg_id)
             run_id = result.get("uuid", result.get("executionRunId", ""))
             print(f"OK (runId: {run_id})")
             succeeded += 1
