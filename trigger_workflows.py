@@ -1,33 +1,28 @@
 #!/usr/bin/env python3
 """Trigger Pennsieve workflow runs for a list of package IDs.
 
-Supports three workflows: NIfTI-to-Zarr, OME-TIFF-to-Zarr, and plain TIFF-to-Zarr.
+Workflow types are defined in workflows.yaml — add new types there without
+changing this script.
 
 Usage:
     # Dataset mode: auto-discover packages, run all workflows
-    python trigger_workflows.py --dataset --nifti --tiff --plain-tiff
+    python trigger_workflows.py --dataset
 
-    # Dataset mode: only nifti
-    python trigger_workflows.py --dataset --nifti
+    # Dataset mode: specific workflows
+    python trigger_workflows.py --dataset -w nifti -w tiff
 
-    # Dataset mode: only plain tiffs
-    python trigger_workflows.py --dataset --plain-tiff
-
-    # File mode: run package IDs through nifti workflow
-    python trigger_workflows.py package_ids.txt --nifti
-
-    # File mode: run package IDs through tiff workflow
-    python trigger_workflows.py package_ids.txt --tiff
-
-    # File mode: run package IDs through plain tiff workflow
-    python trigger_workflows.py package_ids.txt --plain-tiff
+    # File mode: run package IDs through a specific workflow
+    python trigger_workflows.py package_ids.txt -w nifti
 
     # Check run statuses from a log file
     python trigger_workflows.py --status logs/runs_2026-08-26_143022.log
 
     # Check which packages are missing ome-zarr/thumb assets
-    python trigger_workflows.py --asset-check --nifti
-    python trigger_workflows.py --asset-check --dataset-id N:dataset:xxx --nifti
+    python trigger_workflows.py --asset-check -w nifti
+    python trigger_workflows.py --asset-check --dataset-id N:dataset:xxx -w nifti
+
+    # Legacy flags still work
+    python trigger_workflows.py --dataset --nifti --tiff --plain-tiff
 """
 
 from __future__ import annotations
@@ -41,33 +36,93 @@ from datetime import datetime
 from pathlib import Path
 
 import requests
+import yaml
 from dotenv import load_dotenv
 
 load_dotenv()
 
 SCRIPT_DIR = Path(__file__).parent
 LOGS_DIR = SCRIPT_DIR / "logs"
-
-NIFTI_EXTENSIONS = (".nii.gz", ".nii")
-TIFF_EXTENSIONS = (".ome.tiff", ".ome.tif")
-PLAIN_TIFF_EXTENSIONS = (".tiff", ".tif")
+DEFAULT_CONFIG_PATH = SCRIPT_DIR / "workflows.yaml"
 
 
-def classify_package(name: str) -> str | None:
-    """Classify a package name as 'nifti', 'tiff', 'plain_tiff', or None based on file extension."""
+# ---------------------------------------------------------------------------
+# YAML config loading
+# ---------------------------------------------------------------------------
+
+def load_workflow_definitions(config_path: Path = DEFAULT_CONFIG_PATH) -> dict:
+    """Load workflow definitions from YAML and resolve aliases.
+
+    Returns an OrderedDict-like dict (Python 3.7+ dicts preserve insertion order)
+    mapping workflow name -> definition dict.
+    """
+    with open(config_path) as f:
+        raw = yaml.safe_load(f)
+
+    workflows = raw.get("workflows", {})
+
+    # Resolve aliases: inherit env_vars, defaults, cpu, memory from target
+    for name, wf in workflows.items():
+        alias = wf.get("alias_of")
+        if alias:
+            if alias not in workflows:
+                raise ValueError(f"Workflow '{name}' aliases '{alias}' which is not defined")
+            target = workflows[alias]
+            for key in ("env_vars", "defaults", "cpu", "memory", "expected_assets"):
+                if key not in wf and key in target:
+                    wf[key] = target[key]
+
+    return workflows
+
+
+def classify_package(name: str, workflow_defs: dict) -> str | None:
+    """Classify a package name by checking extensions in YAML definition order.
+
+    Within each workflow, extensions are checked longest-first so that
+    e.g. '.ome.tiff' matches before '.tiff'.
+    """
     lower = name.lower()
-    # Check OME-TIFF before plain TIFF since .ome.tiff ends with .tiff
-    for ext in TIFF_EXTENSIONS:
-        if lower.endswith(ext):
-            return "tiff"
-    for ext in PLAIN_TIFF_EXTENSIONS:
-        if lower.endswith(ext):
-            return "plain_tiff"
-    for ext in NIFTI_EXTENSIONS:
-        if lower.endswith(ext):
-            return "nifti"
+    for wf_name, wf in workflow_defs.items():
+        # Sort extensions longest-first for correct matching
+        extensions = sorted(wf.get("extensions", []), key=len, reverse=True)
+        for ext in extensions:
+            if lower.endswith(ext):
+                return wf_name
     return None
 
+
+def build_workflow_config(workflow_def: dict, dataset_id: str) -> dict:
+    """Build a workflow config dict by resolving env var names from the YAML definition.
+
+    For each key in env_vars, looks up the env var value, falling back to defaults.
+    """
+    env_vars = workflow_def.get("env_vars", {})
+    defaults = workflow_def.get("defaults", {})
+
+    config = {"dataset_id": dataset_id}
+    for key, env_name in env_vars.items():
+        value = os.environ.get(env_name) or defaults.get(key)
+        config[key] = value
+
+    # CPU and memory with defaults
+    config["cpu"] = workflow_def.get("cpu", "8192")
+    config["memory"] = workflow_def.get("memory", "61440")
+
+    return config
+
+
+def get_all_package_types(workflow_defs: dict, selected: list[str]) -> set[str]:
+    """Get the union of package_types from selected workflows."""
+    types = set()
+    for name in selected:
+        wf = workflow_defs[name]
+        types.update(wf.get("package_types", []))
+    return types
+
+
+# ---------------------------------------------------------------------------
+# API helpers (unchanged)
+# ---------------------------------------------------------------------------
 
 def trigger_workflow_run(api_host: str, token: str, refresh_token: str, config: dict, package_id: str) -> dict:
     """Trigger a single workflow run for one package."""
@@ -79,9 +134,11 @@ def trigger_workflow_run(api_host: str, token: str, refresh_token: str, config: 
                 {"nodeId": config["target_zarr_node_id"], "executionTarget": "standard"},
                 {"nodeId": config["target_thumb_node_id"], "executionTarget": "standard"},
                 {"nodeId": config["thumb_processor_node_id"], "executionTarget": "standard",
-                 "version": config["thumb_processor_version"], "cpu": "8192", "memory": "61440"},
+                 "version": config["thumb_processor_version"],
+                 "cpu": config.get("cpu", "8192"), "memory": config.get("memory", "61440")},
                 {"nodeId": config["converter_processor_node_id"], "executionTarget": "standard",
-                 "version": config["converter_processor_version"], "cpu": "8192", "memory": "61440"},
+                 "version": config["converter_processor_version"],
+                 "cpu": config.get("cpu", "8192"), "memory": config.get("memory", "61440")},
             ],
         },
         "datasetId": config["dataset_id"],
@@ -115,16 +172,13 @@ def trigger_workflow_run(api_host: str, token: str, refresh_token: str, config: 
     return resp.json()
 
 
-PACKAGE_TYPES = ("MRI", "Slide")
-
-
-def fetch_dataset_packages(api_host: str, token: str, refresh_token: str, dataset_id: str) -> list[dict]:
+def fetch_dataset_packages(api_host: str, token: str, refresh_token: str,
+                           dataset_id: str, package_types: set[str]) -> list[dict]:
     """Fetch all non-deleted packages from a dataset via the Pennsieve API.
 
-    Queries for each type in PACKAGE_TYPES separately.
+    Queries for each type in package_types separately.
     Returns list of dicts with 'node_id' and 'name' keys.
     """
-    # The packages endpoint is on the v1 API (api.pennsieve.io), not api2
     packages_host = api_host.replace("api2.", "api.")
     headers = {"Authorization": f"Bearer {token}"}
     if refresh_token:
@@ -132,7 +186,7 @@ def fetch_dataset_packages(api_host: str, token: str, refresh_token: str, datase
     packages = []
     seen = set()
 
-    for pkg_type in PACKAGE_TYPES:
+    for pkg_type in sorted(package_types):
         cursor = None
         type_count = 0
 
@@ -178,7 +232,6 @@ def fetch_dataset_packages(api_host: str, token: str, refresh_token: str, datase
 
 def check_run_statuses(api_host: str, token: str, log_file: str):
     """Parse a log file for runIds and check their workflow run status."""
-    # Parse lines like: [1/200] Triggering for package: N:package:xxx... OK (runId: abc-123)
     pattern = re.compile(r"package:\s*(N:package:[0-9a-f-]+).*\(runId:\s*([0-9a-f-]+)\)")
 
     runs = []
@@ -219,12 +272,10 @@ def check_run_statuses(api_host: str, token: str, log_file: str):
         if i % 50 == 0:
             print(f"  Checked {i}/{len(runs)}...")
 
-    # Print summary
     print(f"\nSummary: {len(results.get('SUCCEEDED', []))} succeeded, "
           f"{len(results.get('FAILED', []))} failed, "
           f"{len(runs) - len(results.get('SUCCEEDED', [])) - len(results.get('FAILED', []))} other")
 
-    # Print non-succeeded runs
     for status in ("FAILED", "STARTED", "FINALIZING"):
         if results.get(status):
             print(f"\n{status}:")
@@ -236,7 +287,6 @@ def check_run_statuses(api_host: str, token: str, log_file: str):
         for run in errors:
             print(f"  {run['package_id']}: {run['status']}")
 
-    # Print failed package IDs for easy copy-paste into a batch file
     failed = results.get("FAILED", [])
     if failed:
         print(f"\nFailed package IDs ({len(failed)}):")
@@ -248,7 +298,6 @@ def get_package_assets(api_host: str, token: str, dataset_id: str, package_id: s
     """Get viewer assets for a package. Tries discover endpoint first, falls back to non-published."""
     headers = {"Authorization": f"Bearer {token}"}
 
-    # Try published/discover endpoint first
     resp = requests.get(
         f"{api_host}/packages/discover/assets",
         headers=headers,
@@ -259,7 +308,6 @@ def get_package_assets(api_host: str, token: str, dataset_id: str, package_id: s
         if assets:
             return assets
 
-    # Fall back to non-published endpoint
     resp = requests.get(
         f"{api_host}/packages/assets",
         headers=headers,
@@ -274,14 +322,18 @@ def get_package_assets(api_host: str, token: str, dataset_id: str, package_id: s
 
 
 def check_package_assets(api_host: str, token: str, refresh_token: str, dataset_id: str,
-                         workflow_types: list[str]):
-    """Check which packages in a dataset are missing ome-zarr and/or thumb assets."""
-    packages = fetch_dataset_packages(api_host, token, refresh_token, dataset_id)
+                         workflow_types: list[str], workflow_defs: dict):
+    """Check which packages in a dataset are missing expected assets.
 
-    # Filter to requested types
+    Expected asset types are read from each workflow's 'expected_assets' list
+    in workflows.yaml (defaults to ["ome-zarr", "thumb"]).
+    """
+    pkg_types = get_all_package_types(workflow_defs, workflow_types)
+    packages = fetch_dataset_packages(api_host, token, refresh_token, dataset_id, pkg_types)
+
     filtered = []
     for pkg in packages:
-        file_type = classify_package(pkg["name"])
+        file_type = classify_package(pkg["name"], workflow_defs)
         if file_type in workflow_types:
             pkg["file_type"] = file_type
             filtered.append(pkg)
@@ -290,59 +342,57 @@ def check_package_assets(api_host: str, token: str, refresh_token: str, dataset_
         print("No matching packages found.")
         return
 
+    # Collect the union of expected asset types across selected workflows
+    expected_by_workflow = {}
+    for wf_name in workflow_types:
+        expected_by_workflow[wf_name] = workflow_defs[wf_name].get(
+            "expected_assets", ["ome-zarr", "thumb"])
+
     print(f"\nChecking {len(filtered)} packages for viewer assets...\n")
 
     complete = []
-    missing_zarr = []
-    missing_thumb = []
-    missing_both = []
+    incomplete = []  # list of (pkg, missing_assets)
 
     for i, pkg in enumerate(filtered, 1):
         try:
             assets = get_package_assets(api_host, token, dataset_id, pkg["node_id"])
             asset_types = {a["asset_type"] for a in assets}
 
-            has_zarr = "ome-zarr" in asset_types
-            has_thumb = "thumb" in asset_types
+            expected = expected_by_workflow.get(pkg["file_type"], ["ome-zarr", "thumb"])
+            missing = [a for a in expected if a not in asset_types]
 
-            if has_zarr and has_thumb:
+            if not missing:
                 complete.append(pkg)
-            elif not has_zarr and not has_thumb:
-                missing_both.append(pkg)
-            elif not has_zarr:
-                missing_zarr.append(pkg)
             else:
-                missing_thumb.append(pkg)
+                incomplete.append((pkg, missing))
 
         except requests.HTTPError as e:
             if e.response.status_code in (401, 403):
                 print(f"\nAuth error at package {i}/{len(filtered)}. Token may have expired.")
                 print(f"Checked {i - 1} packages before error.")
                 break
-            missing_both.append(pkg)
+            expected = expected_by_workflow.get(pkg.get("file_type"), ["ome-zarr", "thumb"])
+            incomplete.append((pkg, expected))
         except Exception as e:
             print(f"  Error checking {pkg['node_id']}: {e}")
-            missing_both.append(pkg)
+            expected = expected_by_workflow.get(pkg.get("file_type"), ["ome-zarr", "thumb"])
+            incomplete.append((pkg, expected))
 
         if i % 25 == 0:
             print(f"  Checked {i}/{len(filtered)}...")
 
-    # Summary
-    total_checked = len(complete) + len(missing_zarr) + len(missing_thumb) + len(missing_both)
-    total_incomplete = len(missing_zarr) + len(missing_thumb) + len(missing_both)
-    print(f"\nResults: {len(complete)}/{total_checked} packages have both assets")
-    if missing_both:
-        print(f"  Missing both:     {len(missing_both)}")
-    if missing_zarr:
-        print(f"  Missing ome-zarr: {len(missing_zarr)}")
-    if missing_thumb:
-        print(f"  Missing thumb:    {len(missing_thumb)}")
+    total_checked = len(complete) + len(incomplete)
+    print(f"\nResults: {len(complete)}/{total_checked} packages have all expected assets")
 
-    # List incomplete package IDs for re-processing
-    if total_incomplete > 0:
-        all_incomplete = missing_both + missing_zarr + missing_thumb
-        print(f"\nIncomplete package IDs ({total_incomplete}):")
-        for pkg in all_incomplete:
+    if incomplete:
+        # Group by missing asset combination for a cleaner summary
+        from collections import Counter
+        missing_counts = Counter(tuple(sorted(m)) for _, m in incomplete)
+        for missing_combo, count in missing_counts.most_common():
+            print(f"  Missing {', '.join(missing_combo)}: {count}")
+
+        print(f"\nIncomplete package IDs ({len(incomplete)}):")
+        for pkg, missing in incomplete:
             print(pkg["node_id"])
 
 
@@ -407,62 +457,60 @@ def run_workflow(args, workflow_config: dict, package_ids: list[str], label: str
     return succeeded, failed
 
 
-def build_nifti_config(args) -> dict:
-    """Build workflow config dict for NIfTI workflow."""
-    return {
-        "workflow_id": args.workflow_id,
-        "dataset_id": args.dataset_id,
-        "compute_node_id": args.compute_node_id,
-        "source_node_id": args.source_node_id,
-        "target_zarr_node_id": args.target_zarr_node_id,
-        "target_thumb_node_id": args.target_thumb_node_id,
-        "converter_processor_node_id": args.nifti_processor_node_id,
-        "thumb_processor_node_id": args.thumb_processor_node_id,
-        "converter_processor_version": args.nifti_processor_version,
-        "thumb_processor_version": args.thumb_processor_version,
-    }
+# ---------------------------------------------------------------------------
+# Validation
+# ---------------------------------------------------------------------------
 
-
-def build_tiff_config(args) -> dict:
-    """Build workflow config dict for OME-TIFF workflow."""
-    return {
-        "workflow_id": args.tiff_workflow_id,
-        "dataset_id": args.dataset_id,
-        "compute_node_id": args.tiff_compute_node_id,
-        "source_node_id": args.tiff_source_node_id,
-        "target_zarr_node_id": args.tiff_target_zarr_node_id,
-        "target_thumb_node_id": args.tiff_target_thumb_node_id,
-        "converter_processor_node_id": args.tiff_processor_node_id,
-        "thumb_processor_node_id": args.tiff_thumb_processor_node_id,
-        "converter_processor_version": args.tiff_processor_version,
-        "thumb_processor_version": args.tiff_thumb_processor_version,
-    }
-
-
-def validate_config(args) -> list[str]:
-    """Validate required config. Returns list of missing items."""
+def validate_config(args, workflow_defs: dict) -> list[str]:
+    """Validate required config for selected workflows. Returns list of missing items."""
     missing = []
     if not args.session_token:
         missing.append("PENNSIEVE_SESSION_TOKEN (--session-token)")
     if not args.dataset_id:
         missing.append("DATASET_ID (--dataset-id)")
 
-    if args.nifti:
-        if not args.workflow_id:
-            missing.append("WORKFLOW_ID (--workflow-id)")
-        if not args.compute_node_id:
-            missing.append("COMPUTE_NODE_ID (--compute-node-id)")
-
-    if args.tiff or args.plain_tiff:
-        if not args.tiff_workflow_id:
-            missing.append("TIFF_WORKFLOW_ID (--tiff-workflow-id)")
-        if not args.tiff_compute_node_id:
-            missing.append("TIFF_COMPUTE_NODE_ID (--tiff-compute-node-id)")
+    # Check critical env vars for each selected workflow
+    critical_keys = ("workflow_id", "compute_node_id")
+    for wf_name in args.workflows:
+        wf = workflow_defs[wf_name]
+        env_vars = wf.get("env_vars", {})
+        for key in critical_keys:
+            env_name = env_vars.get(key)
+            if env_name and not os.environ.get(env_name):
+                label = wf.get("label", wf_name)
+                missing.append(f"{env_name} ({label} workflow)")
 
     return missing
 
 
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
 def main():
+    # Load workflow definitions first so we can use them in argparse
+    try:
+        config_path = DEFAULT_CONFIG_PATH
+        # Quick pre-parse for --config flag
+        for i, arg in enumerate(sys.argv[1:], 1):
+            if arg == "--config" and i < len(sys.argv) - 1:
+                config_path = Path(sys.argv[i + 1])
+                break
+            if arg.startswith("--config="):
+                config_path = Path(arg.split("=", 1)[1])
+                break
+
+        workflow_defs = load_workflow_definitions(config_path)
+    except FileNotFoundError:
+        print(f"Error: Config file not found: {config_path}", file=sys.stderr)
+        print("Create workflows.yaml or specify --config <path>.", file=sys.stderr)
+        sys.exit(1)
+    except Exception as e:
+        print(f"Error loading workflow config: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    available_names = list(workflow_defs.keys())
+
     parser = argparse.ArgumentParser(
         description="Trigger Pennsieve workflow runs for multiple packages"
     )
@@ -478,13 +526,24 @@ def main():
         help="Package ID (can be specified multiple times)",
     )
 
-    # Workflow type selection
-    parser.add_argument("--nifti", action="store_true",
-                        help="Run the NIfTI-to-Zarr workflow")
-    parser.add_argument("--tiff", action="store_true",
-                        help="Run the OME-TIFF-to-Zarr workflow")
-    parser.add_argument("--plain-tiff", action="store_true",
-                        help="Run the plain TIFF-to-Zarr workflow (uses same converter as OME-TIFF)")
+    # Workflow type selection — new style
+    parser.add_argument(
+        "-w", "--workflow",
+        action="append",
+        dest="workflows",
+        metavar="NAME",
+        help=f"Workflow type to run (repeatable). Available: {', '.join(available_names)}",
+    )
+    parser.add_argument(
+        "--config",
+        default=str(DEFAULT_CONFIG_PATH),
+        help="Path to workflows.yaml config file",
+    )
+
+    # Legacy flags (hidden, for backwards compat)
+    parser.add_argument("--nifti", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--tiff", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--plain-tiff", action="store_true", help=argparse.SUPPRESS)
 
     # General config
     parser.add_argument("--api-host", default=os.environ.get("PENNSIEVE_API_HOST", "https://api2.pennsieve.io"))
@@ -504,30 +563,24 @@ def main():
                         help="Check workflow run statuses from a previous run's log file")
     parser.add_argument("--asset-check", action="store_true",
                         help="Check which packages are missing ome-zarr/thumb assets")
-
-    # NIfTI workflow config
-    parser.add_argument("--workflow-id", default=os.environ.get("WORKFLOW_ID"))
-    parser.add_argument("--compute-node-id", default=os.environ.get("COMPUTE_NODE_ID"))
-    parser.add_argument("--source-node-id", default=os.environ.get("SOURCE_NODE_ID"))
-    parser.add_argument("--target-zarr-node-id", default=os.environ.get("TARGET_ZARR_NODE_ID"))
-    parser.add_argument("--target-thumb-node-id", default=os.environ.get("TARGET_THUMB_NODE_ID"))
-    parser.add_argument("--nifti-processor-node-id", default=os.environ.get("NIFTI_PROCESSOR_NODE_ID"))
-    parser.add_argument("--thumb-processor-node-id", default=os.environ.get("THUMB_PROCESSOR_NODE_ID"))
-    parser.add_argument("--nifti-processor-version", default=os.environ.get("NIFTI_PROCESSOR_VERSION", "v1.1.1"))
-    parser.add_argument("--thumb-processor-version", default=os.environ.get("THUMB_PROCESSOR_VERSION", "v1.3.1"))
-
-    # TIFF workflow config
-    parser.add_argument("--tiff-workflow-id", default=os.environ.get("TIFF_WORKFLOW_ID"))
-    parser.add_argument("--tiff-compute-node-id", default=os.environ.get("TIFF_COMPUTE_NODE_ID"))
-    parser.add_argument("--tiff-source-node-id", default=os.environ.get("TIFF_SOURCE_NODE_ID"))
-    parser.add_argument("--tiff-target-zarr-node-id", default=os.environ.get("TIFF_TARGET_ZARR_NODE_ID"))
-    parser.add_argument("--tiff-target-thumb-node-id", default=os.environ.get("TIFF_TARGET_THUMB_NODE_ID"))
-    parser.add_argument("--tiff-processor-node-id", default=os.environ.get("TIFF_PROCESSOR_NODE_ID"))
-    parser.add_argument("--tiff-thumb-processor-node-id", default=os.environ.get("TIFF_THUMB_PROCESSOR_NODE_ID"))
-    parser.add_argument("--tiff-processor-version", default=os.environ.get("TIFF_PROCESSOR_VERSION", "v1.2.4"))
-    parser.add_argument("--tiff-thumb-processor-version", default=os.environ.get("TIFF_THUMB_PROCESSOR_VERSION", "v1.3.1"))
+    parser.add_argument("--list-packages", action="store_true",
+                        help="Discover packages from --dataset and save IDs to batches/ (no workflows triggered)")
 
     args = parser.parse_args()
+
+    # Resolve legacy flags into args.workflows
+    legacy_map = {"nifti": args.nifti, "tiff": args.tiff, "plain_tiff": args.plain_tiff}
+    legacy_used = [name for name, flag in legacy_map.items() if flag]
+    if legacy_used:
+        if args.workflows:
+            parser.error("Cannot mix legacy flags (--nifti, --tiff, --plain-tiff) with -w/--workflow.")
+        args.workflows = legacy_used
+
+    # Validate workflow names
+    if args.workflows:
+        for name in args.workflows:
+            if name not in workflow_defs:
+                parser.error(f"Unknown workflow '{name}'. Available: {', '.join(available_names)}")
 
     # Status check mode
     if args.status:
@@ -545,74 +598,95 @@ def main():
         if not args.dataset_id:
             print("Error: DATASET_ID required.", file=sys.stderr)
             sys.exit(1)
-        # Determine which types to check
-        types = []
-        if args.nifti:
-            types.append("nifti")
-        if args.tiff:
-            types.append("tiff")
-        if args.plain_tiff:
-            types.append("plain_tiff")
-        if not types:
-            types = ["nifti", "tiff", "plain_tiff"]
+        types = args.workflows if args.workflows else available_names
         check_package_assets(args.api_host, args.session_token, args.refresh_token,
-                             args.dataset_id, types)
+                             args.dataset_id, types, workflow_defs)
         return
 
-    # Validate workflow type selection
-    # In dataset mode, default to all workflows when no type flag is given
-    if args.dataset and not args.nifti and not args.tiff:
-        args.nifti = True
-        args.tiff = True
+    # List packages mode
+    if args.list_packages:
+        if not args.session_token:
+            print("Error: PENNSIEVE_SESSION_TOKEN required.", file=sys.stderr)
+            sys.exit(1)
+        if not args.dataset_id:
+            print("Error: DATASET_ID required.", file=sys.stderr)
+            sys.exit(1)
+        types = args.workflows if args.workflows else available_names
+        pkg_types = get_all_package_types(workflow_defs, types)
+        print(f"Discovering packages from dataset {args.dataset_id}...")
+        packages = fetch_dataset_packages(args.api_host, args.session_token, args.refresh_token,
+                                          args.dataset_id, pkg_types)
 
-    if not args.nifti and not args.tiff and not args.plain_tiff:
-        parser.error("At least one workflow type must be specified: --nifti, --tiff, and/or --plain-tiff")
+        batches_dir = SCRIPT_DIR / "batches"
+        batches_dir.mkdir(exist_ok=True)
+        timestamp = datetime.now().strftime("%Y-%m-%d_%H%M%S")
 
-    selected_types = sum([args.nifti, args.tiff, args.plain_tiff])
-    if not args.dataset and selected_types > 1:
-        parser.error("Cannot use multiple workflow types without --dataset. "
-                      "In file/CLI mode, specify exactly one: --nifti, --tiff, or --plain-tiff.")
+        for wf_name in types:
+            label = workflow_defs[wf_name].get("label", wf_name)
+            ids = [pkg["node_id"] for pkg in packages
+                   if classify_package(pkg["name"], workflow_defs) == wf_name]
+            if not ids:
+                print(f"  {label}: 0 packages (skipped)")
+                continue
+            out_path = batches_dir / f"{wf_name}_{timestamp}.txt"
+            with open(out_path, "w") as f:
+                f.write(f"# {label} packages from {args.dataset_id}\n")
+                f.write(f"# Generated: {datetime.now().isoformat()}\n")
+                for pkg_id in ids:
+                    f.write(pkg_id + "\n")
+            print(f"  {label}: {len(ids)} packages -> {out_path}")
+        return
+
+    # In dataset mode, default to all workflows when none specified
+    if args.dataset and not args.workflows:
+        args.workflows = available_names
+
+    if not args.workflows:
+        parser.error(f"At least one workflow must be specified with -w/--workflow. "
+                     f"Available: {', '.join(available_names)}")
+
+    if not args.dataset and len(args.workflows) > 1:
+        parser.error("Cannot use multiple workflows without --dataset. "
+                      "In file/CLI mode, specify exactly one with -w.")
 
     # Validate required config
-    missing = validate_config(args)
+    missing = validate_config(args, workflow_defs)
     if missing:
         print(f"Error: Missing required config:\n  " + "\n  ".join(missing), file=sys.stderr)
         print("\nSet these in .env or pass as CLI args.", file=sys.stderr)
         sys.exit(1)
 
-    # Collect package IDs
-    nifti_package_ids = []
-    tiff_package_ids = []
-    plain_tiff_package_ids = []
+    # Build configs for selected workflows
+    workflow_configs = {}
+    for wf_name in args.workflows:
+        workflow_configs[wf_name] = build_workflow_config(workflow_defs[wf_name], args.dataset_id)
+
+    # Collect package IDs per workflow
+    workflow_packages = {wf_name: [] for wf_name in args.workflows}
 
     if args.dataset:
+        pkg_types = get_all_package_types(workflow_defs, args.workflows)
         print(f"Discovering packages from dataset {args.dataset_id}...")
-        packages = fetch_dataset_packages(args.api_host, args.session_token, args.refresh_token, args.dataset_id)
+        packages = fetch_dataset_packages(args.api_host, args.session_token, args.refresh_token,
+                                          args.dataset_id, pkg_types)
 
         skipped = []
         for pkg in packages:
-            file_type = classify_package(pkg["name"])
-            if file_type == "nifti" and args.nifti:
-                nifti_package_ids.append(pkg["node_id"])
-            elif file_type == "tiff" and args.tiff:
-                tiff_package_ids.append(pkg["node_id"])
-            elif file_type == "plain_tiff" and args.plain_tiff:
-                plain_tiff_package_ids.append(pkg["node_id"])
+            file_type = classify_package(pkg["name"], workflow_defs)
+            if file_type in workflow_packages:
+                workflow_packages[file_type].append(pkg["node_id"])
             else:
                 skipped.append(pkg)
 
         print(f"\nFound {len(packages)} packages total:")
-        if args.nifti:
-            print(f"  NIfTI:      {len(nifti_package_ids)}")
-        if args.tiff:
-            print(f"  OME-TIFF:   {len(tiff_package_ids)}")
-        if args.plain_tiff:
-            print(f"  Plain TIFF: {len(plain_tiff_package_ids)}")
+        for wf_name in args.workflows:
+            label = workflow_defs[wf_name].get("label", wf_name)
+            print(f"  {label}: {len(workflow_packages[wf_name])}")
         if skipped:
             print(f"  Skipped:    {len(skipped)}")
         print()
 
-        if not nifti_package_ids and not tiff_package_ids and not plain_tiff_package_ids:
+        if not any(workflow_packages.values()):
             print("No matching packages found for the selected workflow type(s).")
             return
     else:
@@ -626,12 +700,8 @@ def main():
         if not package_ids:
             parser.error("No package IDs provided. Use a file, --package-id flags, or --dataset.")
 
-        if args.nifti:
-            nifti_package_ids = package_ids
-        elif args.tiff:
-            tiff_package_ids = package_ids
-        else:
-            plain_tiff_package_ids = package_ids
+        wf_name = args.workflows[0]
+        workflow_packages[wf_name] = package_ids
 
     print(f"Dataset ID:        {args.dataset_id}")
     print(f"API host:          {args.api_host}")
@@ -656,21 +726,13 @@ def main():
     total_failed = 0
 
     try:
-        if nifti_package_ids:
-            nifti_config = build_nifti_config(args)
-            s, f = run_workflow(args, nifti_config, nifti_package_ids, "NIfTI", log_file)
-            total_succeeded += s
-            total_failed += f
-
-        if tiff_package_ids:
-            tiff_config = build_tiff_config(args)
-            s, f = run_workflow(args, tiff_config, tiff_package_ids, "OME-TIFF", log_file)
-            total_succeeded += s
-            total_failed += f
-
-        if plain_tiff_package_ids:
-            plain_tiff_config = build_tiff_config(args)
-            s, f = run_workflow(args, plain_tiff_config, plain_tiff_package_ids, "Plain TIFF", log_file)
+        for wf_name in args.workflows:
+            pkg_ids = workflow_packages[wf_name]
+            if not pkg_ids:
+                continue
+            label = workflow_defs[wf_name].get("label", wf_name)
+            config = workflow_configs[wf_name]
+            s, f = run_workflow(args, config, pkg_ids, label, log_file)
             total_succeeded += s
             total_failed += f
 

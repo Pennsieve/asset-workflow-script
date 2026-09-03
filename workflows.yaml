@@ -1,0 +1,73 @@
+# Workflow type definitions for trigger_workflows.py
+#
+# Adding a new workflow type:
+#   1. Add a block below with extensions, package_types, env_vars, and defaults
+#   2. Add corresponding env vars to your .env file
+#   3. Run: python trigger_workflows.py --dataset -w <name> --dry-run
+#
+# Definition order matters for extension matching — put more specific
+# extensions first (e.g. .ome.tiff before .tiff).
+
+workflows:
+  nifti:
+    label: "NIfTI"
+    extensions: [".nii.gz", ".nii"]
+    package_types: ["MRI"]
+    env_vars:
+      workflow_id: "NIFTI_WORKFLOW_ID"
+      compute_node_id: "NIFTI_COMPUTE_NODE_ID"
+      source_node_id: "NIFTI_SOURCE_NODE_ID"
+      target_zarr_node_id: "NIFTI_TARGET_ZARR_NODE_ID"
+      target_thumb_node_id: "NIFTI_TARGET_THUMB_NODE_ID"
+      converter_processor_node_id: "NIFTI_PROCESSOR_NODE_ID"
+      thumb_processor_node_id: "NIFTI_THUMB_PROCESSOR_NODE_ID"
+      converter_processor_version: "NIFTI_PROCESSOR_VERSION"
+      thumb_processor_version: "NIFTI_THUMB_PROCESSOR_VERSION"
+    expected_assets: ["ome-zarr", "thumb"]
+    defaults:
+      converter_processor_version: "v1.1.1"
+      thumb_processor_version: "v1.3.1"
+
+  tiff:
+    label: "OME-TIFF"
+    extensions: [".ome.tiff", ".ome.tif"]
+    package_types: ["Slide"]
+    env_vars:
+      workflow_id: "TIFF_WORKFLOW_ID"
+      compute_node_id: "TIFF_COMPUTE_NODE_ID"
+      source_node_id: "TIFF_SOURCE_NODE_ID"
+      target_zarr_node_id: "TIFF_TARGET_ZARR_NODE_ID"
+      target_thumb_node_id: "TIFF_TARGET_THUMB_NODE_ID"
+      converter_processor_node_id: "TIFF_PROCESSOR_NODE_ID"
+      thumb_processor_node_id: "TIFF_THUMB_PROCESSOR_NODE_ID"
+      converter_processor_version: "TIFF_PROCESSOR_VERSION"
+      thumb_processor_version: "TIFF_THUMB_PROCESSOR_VERSION"
+    expected_assets: ["ome-zarr", "thumb"]
+    defaults:
+      converter_processor_version: "v1.2.4"
+      thumb_processor_version: "v1.3.1"
+
+  plain_tiff:
+    label: "Plain TIFF"
+    extensions: [".tiff", ".tif"]
+    package_types: ["Slide"]
+    alias_of: "tiff"
+
+  timeseries:
+    label: "Timeseries"
+    extensions: [".edf", ".mef", ".eeg"]
+    package_types: ["TimeSeries"]
+    env_vars:
+      workflow_id: "TS_WORKFLOW_ID"
+      compute_node_id: "TS_COMPUTE_NODE_ID"
+      source_node_id: "TS_SOURCE_NODE_ID"
+      target_zarr_node_id: "TS_TARGET_ZARR_NODE_ID"
+      target_thumb_node_id: "TS_TARGET_THUMB_NODE_ID"
+      converter_processor_node_id: "TS_PROCESSOR_NODE_ID"
+      thumb_processor_node_id: "TS_THUMB_PROCESSOR_NODE_ID"
+      converter_processor_version: "TS_PROCESSOR_VERSION"
+      thumb_processor_version: "TS_THUMB_PROCESSOR_VERSION"
+    expected_assets: ["timeseries-zarr"]
+    defaults:
+      converter_processor_version: "v1.0.0"
+      thumb_processor_version: "v1.3.1"
