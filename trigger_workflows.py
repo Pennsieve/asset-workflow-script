@@ -93,14 +93,14 @@ def trigger_workflow_run(api_host: str, token: str, refresh_token: str, config: 
         "dataTargets": {
             config["target_zarr_node_id"]: {
                 "params": {
-                    "ASSET_PROPERTIES_FILE": "asset_properties.json",
+                    "ASSET_PROPERTIES_FILE": "asset-properties.json",
                     "ASSET_NAME": "preview",
                     "ASSET_TYPE": "ome-zarr",
                 },
             },
             config["target_thumb_node_id"]: {
                 "params": {
-                    "ASSET_PROPERTIES_FILE": "asset_properties.json",
+                    "ASSET_PROPERTIES_FILE": "asset-properties.json",
                     "ASSET_NAME": "thumbnail",
                     "ASSET_TYPE": "thumb",
                 },

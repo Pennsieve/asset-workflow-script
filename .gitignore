@@ -3,3 +3,11 @@ __pycache__/
 *.pyc
 .venv/
 .DS_Store
+
+# Ignore log files but keep the directory
+logs/*
+!logs/.gitkeep
+
+# Ignore batch files but keep the directory
+batches/*
+!batches/.gitkeep

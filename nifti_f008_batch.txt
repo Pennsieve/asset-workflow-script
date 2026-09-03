@@ -1,5 +1,0 @@
-# NIfTI packages from f008 dataset - missing thumb asset
-N:package:b14fbc96-97bf-4a59-a19b-3ff697820237
-N:package:5b024417-f093-4533-b4bb-b66f178b9296
-N:package:47c7f374-760c-4935-a7b8-87fd3307a726
-N:package:64b00af5-16d6-4c7e-b989-159ade593cf6
