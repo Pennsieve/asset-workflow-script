@@ -167,7 +167,9 @@ def trigger_workflow_run(api_host: str, token: str, refresh_token: str, config: 
     headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
     if refresh_token:
         headers["x-refresh-token"] = refresh_token
-    resp = requests.post(f"{api_host}/compute/workflows/runs", headers=headers, json=payload)
+    # Timeout so a stuck request fails (logged as FAILED) instead of hanging forever (seen 2026-11-10: a
+    # trigger POST never got a response for over an hour, although the run was created and succeeded).
+    resp = requests.post(f"{api_host}/compute/workflows/runs", headers=headers, json=payload, timeout=(30, 600))
     resp.raise_for_status()
     return resp.json()
 
